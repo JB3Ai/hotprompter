@@ -1,0 +1,494 @@
+"use client";
+
+import { useState, useEffect, useRef } from "react";
+import type { DashboardStatusResponse } from "@/lib/dashboard-contract";
+import {
+  GROUPS, EXPLICIT_GROUP, EXPLICIT_KEYS, FIELD_DEFS,
+  emptyDraft, randomizeDraft, hasExplicitSelections, type Draft
+} from "@/lib/options";
+import {
+  buildPrompt, buildNegativePrompt, validatePrompt, type ValidationResult
+} from "@/lib/prompt";
+import PresetsPanel from "./presets-panel";
+import DashboardStatus from "./dashboard-status";
+
+type ComfyStatus = {
+  connected: boolean;
+  ready: boolean;
+  missing: string[];
+  workflow: string;
+};
+
+export default function Page() {
+  const [confirmedAdult, setConfirmedAdult] = useState(false);
+  const [explicitMode, setExplicitMode] = useState(false);
+  const [draft, setDraft] = useState<Draft>(emptyDraft);
+  const [validation, setValidation] = useState<ValidationResult>({ allowed: false, reason: null });
+  const [serverChecked, setServerChecked] = useState(false);
+  const [copied, setCopied] = useState<string | null>(null);
+  const [image, setImage] = useState<string | null>(null);
+  const [imageFilename, setImageFilename] = useState("HOTPROMPTER.png");
+  const [generating, setGenerating] = useState(false);
+  const [genError, setGenError] = useState("");
+  const [generationStatus, setGenerationStatus] = useState("");
+  const [comfyStatus, setComfyStatus] = useState<ComfyStatus | null>(null);
+  const [checkingComfy, setCheckingComfy] = useState(true);
+  const [resolution, setResolution] = useState(512);
+  const [enhancedPrompt, setEnhancedPrompt] = useState("");
+  const [enhancing, setEnhancing] = useState(false);
+  const [enhanceError, setEnhanceError] = useState("");
+  const [enhanceModel, setEnhanceModel] = useState("");
+  const [dashboardStatus, setDashboardStatus] = useState<DashboardStatusResponse | null>(null);
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [describeError, setDescribeError] = useState("");
+  const [notepadText, setNotepadText] = useState("");
+  const [notepadOpen, setNotepadOpen] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const prompt = buildPrompt(draft, { allowExplicit: explicitMode });
+  const activePrompt = enhancedPrompt || prompt;
+  const negativePrompt = buildNegativePrompt();
+  const serviceStateMap = Object.fromEntries((dashboardStatus?.services ?? []).map((service) => [service.id, service]));
+  const lmStudioService = serviceStateMap.lmstudio;
+  const ollamaService = serviceStateMap.ollama;
+  const lmStudioReady = lmStudioService?.state === "online";
+
+  async function checkComfyUI() {
+    setCheckingComfy(true);
+    try {
+      const res = await fetch("/api/generate-image", { cache: "no-store" });
+      const data = await res.json();
+      setComfyStatus(data);
+    } catch {
+      setComfyStatus({ connected: false, ready: false, missing: [], workflow: "Qwen Image 2.1 GGUF · CPU/RAM" });
+    } finally {
+      setCheckingComfy(false);
+    }
+  }
+
+  useEffect(() => {
+    checkComfyUI();
+  }, []);
+
+  useEffect(() => {
+    setValidation(validatePrompt(prompt));
+    setServerChecked(false);
+    setEnhanceError("");
+    setEnhanceModel("");
+    setEnhancedPrompt("");
+  }, [prompt]);
+
+  async function generate() {
+    const res = await fetch("/api/prompt", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(draft)
+    });
+    const data = await res.json();
+    setValidation(data.validation);
+    setServerChecked(true);
+  }
+
+  async function enhancePrompt() {
+    if (!lmStudioReady) {
+      setEnhanceError("LM Studio is not ready for local prompt enhancement.");
+      return;
+    }
+
+    setEnhancing(true);
+    setEnhanceError("");
+    try {
+      const res = await fetch("/api/enhance-prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ draft })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.prompt) {
+        setEnhanceError(data.error ?? "LM Studio could not enhance this prompt.");
+        return;
+      }
+
+      setEnhancedPrompt(data.prompt);
+      setEnhanceModel(data.model ?? "LM Studio");
+      setValidation(data.validation ?? validatePrompt(data.prompt));
+      setServerChecked(true);
+    } catch {
+      setEnhanceError("HOTPROMPTER could not reach LM Studio.");
+    } finally {
+      setEnhancing(false);
+    }
+  }
+
+  async function copy(text: string, key: string) {
+    await navigator.clipboard.writeText(text);
+    setCopied(key);
+    setTimeout(() => setCopied(null), 1500);
+  }
+
+  async function generateImage() {
+    if (!comfyStatus?.ready) {
+      setGenError("ComfyUI is not ready. Start it and refresh the engine status.");
+      return;
+    }
+    setGenerating(true);
+    setGenError("");
+    setGenerationStatus("Sending prompt to ComfyUI…");
+    setImage(null);
+    try {
+      const res = await fetch("/api/generate-image", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ draft, prompt: activePrompt, width: resolution, height: resolution })
+      });
+      const data = await res.json();
+      if (!res.ok || !data.promptId) {
+        setGenError(data.error ?? "ComfyUI did not accept the workflow.");
+        return;
+      }
+
+      setGenerationStatus("Queued in ComfyUI…");
+      while (true) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const statusRes = await fetch(
+          `/api/generate-image?promptId=${encodeURIComponent(data.promptId)}`,
+          { cache: "no-store" }
+        );
+        const statusData = await statusRes.json();
+
+        if (statusRes.status === 202) {
+          setGenerationStatus(statusData.status === "running"
+            ? "ComfyUI is creating the image…"
+            : "Queued in ComfyUI…");
+          continue;
+        }
+
+        if (!statusRes.ok || !statusData.image?.url) {
+          setGenError(statusData.error ?? "Image generation failed.");
+          return;
+        }
+
+        setImage(`${statusData.image.url}&v=${Date.now()}`);
+        setImageFilename(statusData.image.filename ?? "HOTPROMPTER.png");
+        setGenerationStatus("Image ready");
+        return;
+      }
+    } catch {
+      setGenError("HOTPROMPTER lost contact with ComfyUI. The job was not submitted again.");
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  async function handleImageUpload(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setUploadingImage(true);
+    setDescribeError("");
+
+    try {
+      const formData = new FormData();
+      formData.append("image", file);
+
+      const res = await fetch("/api/describe-image", {
+        method: "POST",
+        body: formData
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        setDescribeError(data.error ?? "Failed to describe image");
+        return;
+      }
+
+      setDraft({ ...draft, user: data.description });
+    } catch {
+      setDescribeError("Failed to process image");
+    } finally {
+      setUploadingImage(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    }
+  }
+
+  function loadFromNotepad() {
+    try {
+      const parsed = JSON.parse(notepadText);
+      if (parsed.prompt || parsed.draft) {
+        const nextDraft = JSON.parse(parsed.draft || "{}");
+        setDraft({ ...emptyDraft, ...nextDraft });
+        if (hasExplicitSelections(nextDraft)) {
+          setExplicitMode(true);
+        }
+        return;
+      }
+      if (parsed.persona || parsed.age) {
+        setDraft({ ...emptyDraft, ...parsed });
+        return;
+      }
+    } catch {
+      // Not JSON, so treat it as plain text.
+    }
+
+    setDraft({ ...draft, user: notepadText });
+  }
+
+  if (!confirmedAdult) {
+    return (
+      <main className="adult-check">
+        <div className="adult-card">
+          <p className="eyebrow">Local-only prompt workspace</p>
+          <h1>Prompt Builder</h1>
+          <p>Local personal-use tool. All characters composed here must be consenting adults (18+).</p>
+          <label className="adult-checkbox">
+            <input type="checkbox" onChange={(e) => setConfirmedAdult(e.target.checked)} />
+            <span>I confirm I am 18 years or older.</span>
+          </label>
+        </div>
+      </main>
+    );
+  }
+
+  return (
+    <>
+      <DashboardStatus onStatus={setDashboardStatus} />
+      <main className="workspace-shell">
+        <section className="panel prompt-panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Prompt designer</p>
+              <h2>Prompt fields</h2>
+            </div>
+          </div>
+
+          <div className="image-upload-card">
+            <h3>Image to prompt</h3>
+            <p>Upload an image to generate a text description that can be used as a starting point for a new prompt.</p>
+
+            <input
+              type="file"
+              ref={fileInputRef}
+              accept="image/*"
+              onChange={handleImageUpload}
+              disabled={uploadingImage}
+              style={{ display: "none" }}
+              id="image-upload"
+            />
+            <label htmlFor="image-upload" className="button button-secondary">
+              {uploadingImage ? "Describing image…" : "Upload image & describe"}
+            </label>
+
+            {describeError && <p className="error-text">{describeError}</p>}
+            <small>Requires a vision model in Ollama, such as <code>ollama pull llava</code>.</small>
+          </div>
+
+          <button type="button" className="button" onClick={() => setDraft(randomizeDraft())}>
+            Randomize everything
+          </button>
+
+          <label className="explicit-toggle">
+            <input
+              type="checkbox"
+              checked={explicitMode}
+              onChange={(e) => {
+                const on = e.target.checked;
+                setExplicitMode(on);
+                if (!on) {
+                  const cleared = { ...draft };
+                  for (const k of EXPLICIT_KEYS) cleared[k] = "";
+                  setDraft(cleared);
+                }
+              }}
+            />
+            <span>Enable explicit content options (18+)</span>
+          </label>
+
+          {GROUPS.map((group) =>
+            (group !== EXPLICIT_GROUP || explicitMode) && (
+              <details key={group} className="field-group" open>
+                <summary>{group}</summary>
+                {FIELD_DEFS.filter((f) => f.group === group).map((f) => (
+                  <label key={f.key} className="field-row">
+                    <span>{f.label}</span>
+                    <select
+                      value={draft[f.key]}
+                      onChange={(e) => setDraft({ ...draft, [f.key]: e.target.value })}
+                    >
+                      <option value="">— select —</option>
+                      {f.options.map((o) => <option key={o} value={o}>{o}</option>)}
+                    </select>
+                  </label>
+                ))}
+              </details>
+            )
+          )}
+
+          <button type="button" className="button" onClick={generate}>
+            Generate prompt (server checked)
+          </button>
+        </section>
+
+        <section className="panel output-panel">
+          <div className="panel-header">
+            <div>
+              <p className="eyebrow">Prompt output</p>
+              <h2>Ready to generate</h2>
+            </div>
+          </div>
+
+          <p className={`validation-line ${validation.allowed ? "is-valid" : "is-invalid"}`}>
+            {validation.allowed
+              ? `Valid${serverChecked ? " (verified server-side)" : ""}`
+              : validation.reason ?? "Prompt is incomplete"}
+          </p>
+
+          <div className="provider-section">
+            <div className="provider-header">
+              <h3>Prompt providers</h3>
+              <span className="local-badge">Local AI workspace · No cloud processing</span>
+            </div>
+
+            <div className="provider-grid">
+              <article className="provider-option is-selected" aria-label="LM Studio is the current prompt provider">
+                <span className="provider-option__topline">
+                  <strong>LM Studio</strong>
+                  <span className={`service-dot service-dot--${lmStudioService?.state ?? "offline"}`} aria-hidden="true" />
+                </span>
+                <small>{lmStudioReady ? "Ready · Current provider" : lmStudioService?.detail ?? "Checking local status"}</small>
+                <span>All prompt enhancement currently runs through the selected local LM Studio model.</span>
+              </article>
+
+              <article className="provider-option provider-option--future" aria-disabled="true" aria-label="Ollama is planned for a future upgrade">
+                <span className="provider-option__topline">
+                  <strong>Ollama</strong>
+                  <span className={`service-dot service-dot--${ollamaService?.state ?? "not-configured"}`} aria-hidden="true" />
+                </span>
+                <small>Future upgrade · {ollamaService?.detail ?? "Not configured"}</small>
+                <span>Provider and model selection will become available after the local Ollama prompt adapter is added.</span>
+              </article>
+            </div>
+          </div>
+
+          <div className="prompt-output-card">
+            <div className="prompt-output-card__header">
+              <h3>Active prompt</h3>
+              <button type="button" className="button button-small" onClick={() => setNotepadText(activePrompt)}>
+                Save to notepad
+              </button>
+            </div>
+            <pre>{activePrompt || "—"}</pre>
+            <div className="inline-actions">
+              <button type="button" className="button button-small" disabled={!validation.allowed} onClick={() => copy(activePrompt, "p")}>
+                {copied === "p" ? "Copied!" : "Copy prompt"}
+              </button>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            className="button enhance-button"
+            disabled={!validation.allowed || enhancing || generating || !lmStudioReady}
+            onClick={enhancePrompt}
+          >
+            {enhancing ? "Enhancing…" : "Enhance with LM Studio"}
+          </button>
+          {enhanceModel && <p className="provider-attribution">Enhanced by {enhanceModel}</p>}
+          {enhanceError && <p className="error-text">{enhanceError}</p>}
+
+          <div className="negative-card">
+            <h3>Negative prompt</h3>
+            <pre>{negativePrompt}</pre>
+            <button type="button" className="button button-small" onClick={() => copy(negativePrompt, "n")}>
+              {copied === "n" ? "Copied!" : "Copy negative prompt"}
+            </button>
+          </div>
+
+          <details className="notes-card" open={notepadOpen} onToggle={(event) => setNotepadOpen((event.target as HTMLDetailsElement).open)}>
+            <summary>Notepad</summary>
+            <textarea
+              value={notepadText}
+              onChange={(e) => setNotepadText(e.target.value)}
+              placeholder="Paste prompts here, edit, then load them back into the form…"
+            />
+            <div className="inline-actions">
+              <button type="button" className="button button-small" onClick={() => copy(notepadText, "notepad")} disabled={!notepadText}>
+                {copied === "notepad" ? "Copied!" : "Copy"}
+              </button>
+              <button type="button" className="button button-small" onClick={loadFromNotepad} disabled={!notepadText}>
+                Load to fields
+              </button>
+              <button type="button" className="button button-small" onClick={() => setNotepadText("")} disabled={!notepadText}>
+                Clear
+              </button>
+            </div>
+          </details>
+
+          <div className="generation-card">
+            <div className="generation-card__header">
+              <h3>Image generation</h3>
+              <button type="button" className="button button-small" onClick={checkComfyUI} disabled={checkingComfy || generating}>
+                {checkingComfy ? "Checking…" : "Refresh status"}
+              </button>
+            </div>
+
+            <p className="comfy-status">
+              {checkingComfy
+                ? "Checking the local ComfyUI engine…"
+                : comfyStatus?.ready
+                  ? "Ready to generate"
+                  : comfyStatus?.connected
+                    ? "ComfyUI is online but the workflow is incomplete"
+                    : "ComfyUI is offline — start run_cpu.bat, then refresh"}
+            </p>
+            <small>{comfyStatus?.workflow ?? "Qwen Image 2.1 GGUF · CPU/RAM"}</small>
+
+            {comfyStatus?.connected && !comfyStatus.ready && comfyStatus.missing.length > 0 && (
+              <p className="muted-text">Missing: {comfyStatus.missing.join(", ")}</p>
+            )}
+
+            <label className="field-row resolution-row">
+              <span>Square image size</span>
+              <select value={resolution} onChange={(e) => setResolution(Number(e.target.value))} disabled={generating}>
+                <option value={512}>512 × 512 (lower RAM)</option>
+                <option value={768}>768 × 768</option>
+                <option value={1024}>1024 × 1024</option>
+              </select>
+            </label>
+          </div>
+
+          <button
+            type="button"
+            className="button generate-button"
+            disabled={!validation.allowed || generating || !comfyStatus?.ready}
+            onClick={generateImage}
+          >
+            {generating ? "ComfyUI is working…" : "Generate image with ComfyUI"}
+          </button>
+
+          {generationStatus && <p className="status-line" aria-live="polite">{generationStatus}</p>}
+          {genError && <p className="error-text">{genError}</p>}
+
+          {image && (
+            <div className="image-preview">
+              <img src={image} alt="Generated by ComfyUI" width={resolution} height={resolution} />
+              <a href={`${image}&download=1`} download={imageFilename} className="button button-small">
+                Download PNG
+              </a>
+            </div>
+          )}
+
+          <PresetsPanel
+            draft={draft}
+            validationAllowed={validation.allowed}
+            onLoad={(loaded) => {
+              setDraft({ ...emptyDraft, ...loaded });
+              if (hasExplicitSelections(loaded)) setExplicitMode(true);
+            }}
+          />
+        </section>
+      </main>
+    </>
+  );
+}

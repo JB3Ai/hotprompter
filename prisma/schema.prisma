@@ -1,0 +1,16 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Preset {
+  id        String   @id @default(cuid())
+  name      String
+  draft     String   // JSON-serialized dropdown state
+  prompt    String   // validated prompt text
+  createdAt DateTime @default(now())
+}
