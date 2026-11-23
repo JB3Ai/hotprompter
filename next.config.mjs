@@ -1,4 +1,9 @@
-/** @type {import('next').NextConfig} */
-const nextConfig = { experimental: { instrumentationHook: true } };
+import { PHASE_DEVELOPMENT_SERVER } from 'next/constants.js';
 
-export default nextConfig;
+export default async function nextConfig(phase) {
+  if (phase === PHASE_DEVELOPMENT_SERVER) {
+    const { initOpenNextCloudflareForDev } = await import('@opennextjs/cloudflare');
+    await initOpenNextCloudflareForDev();
+  }
+  return {};
+}
